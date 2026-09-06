@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Replace served-model-id everywhere with the ID your local server exposes.
+  "model": "local/served-model-id",
+  "providers": {
+    "local": {
+      "name": "Local inference",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      // Change port/base path to match your OpenAI-compatible server.
+      "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "served-model-id": { "name": "Local coding model" }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-churn",
+      "options": {
+        "model": "local/served-model-id",
+        "models": {
+          "planner": "local/served-model-id",
+          "builder": "local/served-model-id",
+          "reviewer": "local/served-model-id"
+        },
+        "concurrency": 1,
+        "maxCalls": 256,
+        "steps": 40,
+        "keepAwake": true,
+        "checks": [
+          { "name": "check", "command": ["npm", "run", "check"] }
+        ]
+      }
+    }
+  ]
+}
