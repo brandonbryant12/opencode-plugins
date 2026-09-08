@@ -1,128 +1,118 @@
-# Goal for OpenCode 2
+# OpenCode Plugins
 
-A small `/goal` plugin. Give it a goal or a plan file; it implements the plan one slice at a time, reviews each slice, fixes findings, then runs **ten focused review rounds**.
+Two native OpenCode 2 workflows: **Goal** implements a plan slice by slice; **Swarm** challenges and improves existing work. Both finish with ten adversarial review rounds, independent verification, and a meta-agent assessment. Progress opens automatically in the TUI.
 
-This is the simpler successor to Churn, in the same repository. It uses OpenCode's native TypeScript plugin API. There is no Go service, automatic commit workflow, or separate orchestration framework.
+## When to use what
 
-## Install OpenCode 2 and the plugin
+| Situation | Command | Outcome |
+| --- | --- | --- |
+| A large feature plan you want implemented | `/goal @docs/feature-plan.md` | Ordered implementation, slice reviews, then a full swarm |
+| Work you have already implemented | `/swarm Check the orders feature against @docs/requirements.md` | Review and justified corrections without an implementation loop |
+| A design you want challenged before coding | `/swarm --proposal @docs/design.md` | Design findings and document improvements; software is not implemented |
 
-You need Git and [Bun](https://bun.sh/docs/installation), plus a model provider connected in OpenCode. Development tests additionally require Node.js 22.18+ (CI uses Node 24).
+With no argument, `/swarm` reuses the last saved objective (preserving proposal mode when applicable). Without a saved objective it asks for a scope.
 
-**1. Install the exact OpenCode 2 beta tested by this plugin:**
+For an existing implementation with a long specification, use `/swarm @docs/requirements.md`. File paths are project-relative; spaces need no quotes. An inline `@path` within a sentence is plain task text that workers can read, while a leading `@path` loads the file as the objective.
+
+## Install
+
+Requires Git, Bun, and a provider configured in OpenCode. Compatibility is pinned to **OpenCode 2 beta-19157**; current upstream beta APIs may differ.
 
 ```sh
 bun add --global --trust --minimum-release-age 86400 @opencode-ai/cli@0.0.0-beta-19157
 export PATH="$HOME/.bun/bin:$PATH"
 opencode2 --version
-```
-
-The command is `opencode2`, separate from OpenCode 1's `opencode`. The native binary installation needs `--trust`; the npm age gate rejects releases younger than 24 hours. Merge `"update": "disable"` into global `~/.config/opencode/opencode.jsonc` to keep automatic updates from changing the tested version. If you use `XDG_CONFIG_HOME`, use that directory instead of `~/.config`.
-
-**2. Install this plugin release outside your project:**
-
-```sh
-git clone --branch v0.2.0 --depth 1 https://github.com/brandonbryant12/opencode-churn.git "$HOME/opencode-goal"
-cd "$HOME/opencode-goal"
+git clone --branch v0.3.0 --depth 1 https://github.com/brandonbryant12/opencode-plugins.git "$HOME/opencode-plugins"
+cd "$HOME/opencode-plugins"
 bun install --frozen-lockfile --minimum-release-age 86400
 ```
 
-**3. In the project you want to work on**, add this to `opencode.jsonc` (merge the `plugins` entry if the file already exists):
+Add the clone's absolute path to your project's `opencode.jsonc`, merging existing configuration:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["/absolute/path/to/opencode-goal"]
+  "plugins": ["/absolute/path/to/opencode-plugins"]
 }
 ```
 
-Replace the path with the actual clone location; `~` and `$HOME` are not expanded inside JSON. Add `.opencode/goal/` to your project's `.gitignore` or local Git exclusions so private goals and worker reports stay out of commits. Start OpenCode in that project:
+Paths inside JSON do not expand `~` or `$HOME`. Add `.opencode/goal/` to your project's Git exclusions: it contains private objectives and reports. Start `opencode2` in the project, connect with `/connect`, select your model with `/models`, then run a command above. The root `tui.tsx` entry enables local-directory TUI discovery in this beta. Keep this clone accessible to the local CLI when using a remote server.
 
-```sh
-opencode2
-```
+To retain the tested OpenCode version, merge `"update": "disable"` into global `~/.config/opencode/opencode.jsonc` (or the corresponding `XDG_CONFIG_HOME` directory).
 
-Use `/connect` to connect a provider, and `/models` to select a model. Then:
+## How it works
 
-```text
-/goal Add pagination to orders. Preserve filters and cover empty and last pages.
-```
+Goal starts with a planner and up to 120 ordered slices. Each slice gets one implementer, a fresh reviewer, and up to three repairs with fresh reviews. After all slices pass, it enters Swarm. Swarm alone catalogs the existing scope and starts reviewing immediately.
 
-Or pass a project-relative plan file (spaces in paths are supported without quotes):
+Every one of ten rounds covers every slice in bounded batches of at most five, reduced further for long slice descriptions:
 
-```text
-/goal @docs/plans/orders.md
-```
+1. Three fresh reviewers use different methods: trace contracts, challenge assumptions with counterexamples, and search for omissions or simpler solutions. Each reports explicit coverage and evidence for every assigned slice.
+2. One evaluator considers all findings, accounts for duplicates, fixes justified defects, and rejects unsupported suggestions with reasons. There is only one writer.
+3. A fresh read-only verifier challenges both fixes and rejections against current files. Unresolved findings get at most three repair attempts before pausing.
+4. A fresh read-only meta-agent assesses the round's saved receipts, convergence, weak evidence, and remaining risks. It cites existing receipts, assigns the next three investigations, and updates the report. New concrete findings trigger repair and a full verification sweep before a fresh assessment. It cannot change counters, skip rounds, or grant completion.
 
-OpenCode commands use a **forward slash**: `/goal`, not `\goal`.
+After the last round edits, a final independent sweep checks every batch again. Any repair restarts that entire sweep, so a later edit cannot leave an earlier verdict as the final proof. Three unsuccessful repair sweeps pause the run. The final meta assessment follows this gate.
 
-## The loop
+Round themes cover requirements, correctness, integration, recovery, security, concurrency, performance, validation, simplicity, and final acceptance. Meta guidance supplements the next theme. Empty findings are valid: there is no issue quota or forced code churn. Ten rounds always run.
 
-1. One fresh planner reads the goal and relevant code and saves an ordered plan with acceptance criteria.
-2. For each slice, one fresh implementer edits and validates it, then one fresh reviewer examines it. Findings go to a fresh evaluator to fix or reject with evidence, followed by another review. Three unsuccessful fixes pause the run.
-3. After all slices, run ten rounds. **Each round has three independent reviewers, each walking through every slice, followed by a fourth agent that evaluates all findings and implements justified improvements.**
-4. Completion requires every slice review and all ten evaluations to finish successfully with reported passing checks and no blockers.
+Proposal mode follows the same loop against design sections and decision criteria. Writers can use only `edit` and `write` against the existing source proposal; shell, patch, and other editing tools are denied. Reviews must distinguish design reasoning from implemented or tested behavior.
 
-The ten rounds focus on requirements, correctness, integration, recovery, security, concurrency, performance, tests, simplicity, and final acceptance. Reviewers may find nothing. The evaluator still checks the goal, but does not invent changes to fill a quota.
+## Live progress and reports
 
-Fresh sessions receive the original goal, the relevant slice or complete plan, and only the reports needed for that task. Earlier conversations are not copied into every agent. The full model conversations remain in OpenCode; compact successful outputs are saved as checkpoints.
+The native panel opens once when an active run appears in its launching session. It shows slice and round milestones, per-slice verified rounds, active agents, elapsed time, tokens, reported cost, repair decisions, and the latest meta assessment. Click an active agent to inspect its session. Click a completed coverage mark to inspect its receipt. Press `f` for fullscreen or `esc` to close; a dismissed panel stays closed. `/goal-panel` reopens it.
 
-OpenCode's tested V2 API creates independent worker sessions. These act as sub-agents for the coordinator, but the API does not provide a parent-ID creation parameter, so they are not promised to appear as a native child-session tree. Workers use the launching session's selected model; changing it affects subsequent workers.
+These are completed-work counters, not estimates of time remaining or a quality score. Fix/rejection counts are finding decisions and can include duplicate findings. Cost is OpenCode-reported and may not reflect actual provider billing.
 
-## Controls
+`.opencode/goal/state.json` stores successful checkpoints. `objective.md` holds the original scope, and `receipts/` contains individually readable reports so agents do not need to load a growing state file. `.opencode/goal/report.md` includes review coverage, findings, evaluator decisions, validation evidence, independent verdicts, and meta outcomes. `findings.json` and `coverage.json` provide derived indexes with stable receipt IDs and exact-repeat links. Full conversations remain in OpenCode's worker sessions.
+
+## Controls and recovery
 
 | Command | Action |
 | --- | --- |
-| `/goal <text>` | Start a goal. |
-| `/goal @path/to/plan.md` | Start from a file inside this project. |
-| `/goal-status` | Show current phase and saved progress. |
-| `/goal-stop` | Interrupt workers and preserve partial work. Wait for paused status. |
-| `/goal-resume` | Settle old workers, reuse completed checkpoints, and retry unfinished work. |
+| `/goal-status` | Show saved status and checkpoint path |
+| `/goal-stop` | Interrupt workers; wait for paused status before editing |
+| `/goal-resume` | Settle old workers, reuse completed receipts, retry unfinished work |
+| `/goal-panel` | Open native progress panel |
 
-The progress file is `.opencode/goal/state.json`. Successful tasks are not repeated on resume. An interrupted writer may have left edits; its replacement is told to inspect those first. Invalid reports, timeouts, denied permissions, failed checks, or unresolved findings pause the run. Address the stated blocker before resuming. Do not blindly resume an uncertain external action.
+The controls work for both Goal and Swarm. There is one active run per checkout. Use one OpenCode service per checkout and let the workflow own editing. Invalid reports, denied tools, failed checks, timeouts, missing coverage, and persistent findings pause the run. No failed or canceled result becomes a successful checkpoint.
 
-Use one OpenCode service and one active goal per checkout. Let the goal own editing while it runs. Resume assumes completed slices have not been changed outside the workflow. To abandon a goal or restart after manual changes, stop it and confirm all workers have stopped, then move `.opencode/goal/` aside before starting again. The plugin never resets your source files or Git history. Old Churn v0.1 state is separate and is not migrated.
+Resume assumes previously completed work has not changed. After broad manual edits, stop and settle all workers, move `.opencode/goal/` aside, and start a fresh swarm so stale receipts cannot stand in for new reviews. A terminal failed verifier is re-run after a targeted manual correction. The plugin never resets source files or commits user work. Existing v0.2 goals can resume, but their final review stage runs with the stronger new verification gates.
 
-## Only three options
+## Models, compaction and limits
 
-Defaults keep memory and context use bounded:
+Workers inherit the launching session's selected model and variant. Changing that selection affects later workers. GLM-5.3-Flash and local inference need no plugin-specific provider settings; use your working OpenCode provider configuration. The plugin does not override reasoning effort, temperature, or compaction settings.
+
+Each worker starts fresh with a bounded assignment and relevant receipts. A context hook retains its assignment across native compaction while preserving the host's checkpoint format. Workers can read the saved objective when needed. Native autocompaction remains responsible for managing that worker's ongoing context.
+
+Only three options are supported:
 
 ```jsonc
 {
   "plugins": [{
-    "package": "/absolute/path/to/opencode-goal",
-    "options": {
-      "reviewConcurrency": 1,
-      "steps": 40,
-      "workerTimeoutMinutes": 20
-    }
+    "package": "/absolute/path/to/opencode-plugins",
+    "options": { "reviewConcurrency": 1, "steps": 40, "workerTimeoutMinutes": 20 }
   }]
 }
 ```
 
-- `reviewConcurrency`: 1–3 active reviewers, default **1**. You still get three independent reviews per round. There is always just one writer.
-- `steps`: 1–100 model steps per worker, default **40**.
-- `workerTimeoutMinutes`: 1–120 minutes per worker, default **20**.
+`reviewConcurrency` accepts 1–3; `steps` accepts 1–100; timeout accepts 1–120 minutes. Default concurrency is one for constrained machines; all three independent reviews still run. Plans are limited to 64 KB of source and 120 concise slices; larger programs should use separate feature plans. Reports are bounded and malformed/oversized output pauses for correction. These limits are not billing caps.
 
-There are at most 30 planned slices and three fixes per slice. Ten final rounds always run; this is deliberately thorough and can consume significant inference. These limits are not a token or billing cap. Model permissions remain under your OpenCode configuration; the plugin does not auto-approve prompts. Planner/reviewer agents deny editing and shell access. Writers can use normal tools to implement and run checks. Instructions prohibit commits, publishing, nested agents, and configuration changes; this is not OS-level containment.
+Writers perform checks under repository instructions; the coordinator validates their structured evidence. Read-only reviewers and verifiers inspect files and recorded evidence and cannot run shell checks themselves. Completion means all required review gates passed; it does not independently prove every model claim or guarantee defect-free software. Same-model reviewers can share blind spots. Meta reports preserve validation limits, including unavailable integration environments and device checks.
 
-Tests and checks are run by the writing agent following your repository instructions, rather than by a second configurable command runner. The coordinator validates the report format and rejects reported failures; it does not independently prove the model's validation claims. Real-model quality depends on the selected model. The service must remain running; the plugin does not manage machine sleep.
-
-## Upgrading from Churn
-
-Stop any v0.1 run first. Update the clone to `v0.2.0`, reinstall from the lockfile, replace all old Churn options with the configuration above, and restart OpenCode. Use `/goal` instead of `/churn`. The old `v0.1.0` release remains available.
+Workers are prohibited from spawning agents, committing, pushing, deploying, or changing OpenCode state/configuration. Tool guards deny unsupported tools and enforce read-only roles. Ordinary code writers still have shell access for implementation checks; instructions are not OS containment. The service must remain running.
 
 ## Development
 
 ```sh
 bun install --frozen-lockfile --minimum-release-age 86400
 npm run check
+npm run test:tui
 OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
+GOAL_SMOKE_MODE=swarm OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
+GOAL_SMOKE_MODE=proposal OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
 ```
 
-`src/engine.ts` contains the loop and report contracts, `src/workers.ts` handles OpenCode sessions, and `src/index.ts` registers commands and saves progress. Tests cover ordering, convergence, cancellation, resume, concurrency, failed reports, file boundaries, and worker cleanup. The native smoke test runs all ten rounds against a local deterministic model provider, checks denied reviewer writes, and confirms no commits are created. It makes no paid model calls and does not measure real-model reasoning quality.
+On shared constrained machines, run installs and checks through `~/.local/bin/codex-heavy --`. Tests use at most two workers. Native smoke tests use a local deterministic provider: they exercise real OpenCode loading, tools, permissions, sessions, reports and RPC, without paid inference. They do not benchmark GLM reasoning or simulate every compaction scenario.
 
-On a constrained shared machine, run installs and checks through your shared resource gate, such as `~/.local/bin/codex-heavy -- npm run check`. The test runner uses at most two workers.
+This repository succeeds `opencode-churn`; old release tags remain available. Stop old runs, update the clone, reinstall pinned dependencies, remove old Churn options, and restart OpenCode.
 
-Compatibility is pinned to `@opencode-ai/plugin` and `@opencode-ai/cli` **`0.0.0-beta-19157`**. Current upstream docs can describe newer beta package names or APIs; upgrade only after running the native smoke test.
-
-References: [OpenCode V2 plugins](https://opencode.ai/v2/docs/build/plugins/), [plugin installation](https://opencode.ai/v2/docs/plugins), [permissions](https://opencode.ai/v2/docs/permissions).
+References: [OpenCode plugins](https://opencode.ai/v2/docs/build/plugins/), [compaction](https://opencode.ai/v2/docs/compaction), [OpenAI subagent guidance](https://developers.openai.com/codex/multi-agent), [long-running agent harnesses](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents).
