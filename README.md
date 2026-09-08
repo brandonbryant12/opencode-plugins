@@ -1,148 +1,128 @@
-# OpenCode Churn
+# Goal for OpenCode 2
 
-Give OpenCode 2 a task or a plan. Churn repeatedly plans a small slice, implements it, runs your checks, requests independent reviews, fixes the findings, and commits the reviewed result. It stops when the original goal passes the final audits, a budget expires, or it needs help.
+A small `/goal` plugin. Give it a goal or a plan file; it implements the plan one slice at a time, reviews each slice, fixes findings, then runs **ten focused review rounds**.
 
-Fresh worker sessions keep each planning, implementation, and review task focused. One builder writes at a time. Reviewers cover correctness, security, recovery, validation, performance, and simplicity; the default runs two reviewers concurrently. You can add more perspectives without running them all at once.
+This is the simpler successor to Churn, in the same repository. It uses OpenCode's native TypeScript plugin API. There is no Go service, automatic commit workflow, or separate orchestration framework.
 
-This is an **OpenCode 2 beta plugin**, targeting `@opencode-ai/plugin` and `@opencode-ai/cli` **`0.0.0-beta-19157`**. It does not implement the V1 plugin API. Beta compatibility must be checked when upgrading.
+## Install OpenCode 2 and the plugin
 
-## Install
+You need Git and [Bun](https://bun.sh/docs/installation), plus a model provider connected in OpenCode. Development tests additionally require Node.js 22.18+ (CI uses Node 24).
 
-Requirements: Git, Bun, Node.js 22.18+ for development checks, an OpenCode model connection, and a repository with an initial commit. Node.js 24 is used in CI.
-
-Install the pinned CLI while rejecting npm releases younger than 24 hours:
+**1. Install the exact OpenCode 2 beta tested by this plugin:**
 
 ```sh
 bun add --global --trust --minimum-release-age 86400 @opencode-ai/cli@0.0.0-beta-19157
+export PATH="$HOME/.bun/bin:$PATH"
+opencode2 --version
 ```
 
-That CLI version was published on 2026-09-05 at 16:25 UTC. `--trust` enables the CLI's required native-binary postinstall; the explicit age gate still applies. Check `opencode2 --version` after installation. OpenCode 1's `opencode` command remains separate.
+The command is `opencode2`, separate from OpenCode 1's `opencode`. The native binary installation needs `--trust`; the npm age gate rejects releases younger than 24 hours. Merge `"update": "disable"` into global `~/.config/opencode/opencode.jsonc` to keep automatic updates from changing the tested version. If you use `XDG_CONFIG_HOME`, use that directory instead of `~/.config`.
 
-To keep future updates behind the same gate, merge `"update": "disable"` into your **global** `~/.config/opencode/opencode.jsonc` (or the equivalent under `XDG_CONFIG_HOME`). OpenCode's built-in auto-updater does not pass the package-age flag. Project settings alone do not control that updater. Upgrade manually with the age-gated command after testing a newer eligible version.
-
-Clone the plugin release into a stable directory outside the repository you want to work on:
+**2. Install this plugin release outside your project:**
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/brandonbryant12/opencode-churn.git "$HOME/opencode-churn"
-cd "$HOME/opencode-churn"
+git clone --branch v0.2.0 --depth 1 https://github.com/brandonbryant12/opencode-churn.git "$HOME/opencode-goal"
+cd "$HOME/opencode-goal"
 bun install --frozen-lockfile --minimum-release-age 86400
 ```
 
-The repository also sets `minimumReleaseAge = 86400` in `bunfig.toml`. Keep the lockfile, audit release timestamps when updating it, and retain the explicit age flag for installs outside this directory. A minimum age filters npm dependency resolution; it does not establish the age of a Git tag. Avoid `opencode2 plugin add github:...` when you require the same npm age policy: that installation path does not establish that this gate was applied.
+**3. In the project you want to work on**, add this to `opencode.jsonc` (merge the `plugins` entry if the file already exists):
 
-## Start a task
-
-Use a **dedicated clean worktree**, leaving your other checkout and its uncommitted work alone:
-
-```sh
-cd /path/to/your-repository
-git worktree add --detach ../your-repository-churn HEAD
-cd ../your-repository-churn
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/absolute/path/to/opencode-goal"]
+}
 ```
 
-Copy [examples/opencode.jsonc](examples/opencode.jsonc) into this worktree as `opencode.jsonc`. Set `package` to the absolute path of the installed plugin, such as `/home/you/opencode-churn`, and replace the validation command with your project's checks. Add the config to your local Git exclusions if it is not already tracked:
+Replace the path with the actual clone location; `~` and `$HOME` are not expanded inside JSON. Add `.opencode/goal/` to your project's `.gitignore` or local Git exclusions so private goals and worker reports stay out of commits. Start OpenCode in that project:
 
 ```sh
-printf '\nopencode.jsonc\n' >> "$(git rev-parse --git-path info/exclude)"
 opencode2
 ```
 
-Connect your provider with `/connect` and select a model with `/models`. Then run:
+Use `/connect` to connect a provider, and `/models` to select a model. Then:
 
 ```text
-/churn Implement pagination for the orders list. Preserve current filters, cover empty and last pages, and keep the public API unchanged.
+/goal Add pagination to orders. Preserve filters and cover empty and last pages.
 ```
 
-Or use a committed plan file inside the repository:
+Or pass a project-relative plan file (spaces in paths are supported without quotes):
 
 ```text
-/churn-file docs/plans/orders-pagination.md
+/goal @docs/plans/orders.md
 ```
 
-Churn creates a `churn/<run-id>` branch in that worktree. Keep that checkout dedicated to the run. It commits locally; review the resulting branch before publishing or merging it.
+OpenCode commands use a **forward slash**: `/goal`, not `\goal`.
 
-| Command | Effect |
+## The loop
+
+1. One fresh planner reads the goal and relevant code and saves an ordered plan with acceptance criteria.
+2. For each slice, one fresh implementer edits and validates it, then one fresh reviewer examines it. Findings go to a fresh evaluator to fix or reject with evidence, followed by another review. Three unsuccessful fixes pause the run.
+3. After all slices, run ten rounds. **Each round has three independent reviewers, each walking through every slice, followed by a fourth agent that evaluates all findings and implements justified improvements.**
+4. Completion requires every slice review and all ten evaluations to finish successfully with reported passing checks and no blockers.
+
+The ten rounds focus on requirements, correctness, integration, recovery, security, concurrency, performance, tests, simplicity, and final acceptance. Reviewers may find nothing. The evaluator still checks the goal, but does not invent changes to fill a quota.
+
+Fresh sessions receive the original goal, the relevant slice or complete plan, and only the reports needed for that task. Earlier conversations are not copied into every agent. The full model conversations remain in OpenCode; compact successful outputs are saved as checkpoints.
+
+OpenCode's tested V2 API creates independent worker sessions. These act as sub-agents for the coordinator, but the API does not provide a parent-ID creation parameter, so they are not promised to appear as a native child-session tree. Workers use the launching session's selected model; changing it affects subsequent workers.
+
+## Controls
+
+| Command | Action |
 | --- | --- |
-| `/churn <task>` | Start a new task. At least one configured check is required. |
-| `/churn-file <path>` | Read a plan from a repository-relative file. |
-| `/churn-status` | Show phase, branch, commits, request count, and stop reason. |
-| `/churn-stop` | Interrupt workers and checks, preserving commits and partial edits. |
-| `/churn-resume` | Continue the unfinished run with fresh activation budgets. |
+| `/goal <text>` | Start a goal. |
+| `/goal @path/to/plan.md` | Start from a file inside this project. |
+| `/goal-status` | Show current phase and saved progress. |
+| `/goal-stop` | Interrupt workers and preserve partial work. Wait for paused status. |
+| `/goal-resume` | Settle old workers, reuse completed checkpoints, and retry unfinished work. |
 
-## What each slice proves
+The progress file is `.opencode/goal/state.json`. Successful tasks are not repeated on resume. An interrupted writer may have left edits; its replacement is told to inspect those first. Invalid reports, timeouts, denied permissions, failed checks, or unresolved findings pause the run. Address the stated blocker before resuming. Do not blindly resume an uncertain external action.
 
-V2's public plugin API creates independent sessions, without a parent-ID creation parameter. Churn uses those sessions as workers and records their IDs, roles, model selections, and reports in the run journal. It does not claim they appear as native parent/child subagent sessions in the UI.
+Use one OpenCode service and one active goal per checkout. Let the goal own editing while it runs. Resume assumes completed slices have not been changed outside the workflow. To abandon a goal or restart after manual changes, stop it and confirm all workers have stopped, then move `.opencode/goal/` aside before starting again. The plugin never resets your source files or Git history. Old Churn v0.1 state is separate and is not migrated.
 
-1. A planner selects one bounded slice and observable acceptance criteria.
-2. A builder implements it, including appropriate tests.
-3. Your configured commands run serially and must pass.
-4. Each reviewer examines the same candidate tree and validation evidence. Any actionable finding returns the slice to the builder.
-5. Churn verifies that the reviewed files and Git history still match, then commits that exact tree.
+## Only three options
 
-After the planner considers the goal satisfied, the panel audits the entire task. The default requires **two consecutive clean final audits**, with validation checks, before completion. Simplicity is always included, even in a custom panel. Reviewers must justify concrete, in-scope findings; the loop does not deliberately invent more work.
+Defaults keep memory and context use bounded:
 
-## Configure models and budgets
-
-The current session model is the default. `model` sets a run default; `models.planner`, `models.builder`, and `models.reviewer` override roles; an individual reviewer's `model` overrides its role. Model strings use `provider/model` or `provider/model#variant`. Choices are pinned for each activation and checked against the OpenCode catalog. Churn uses your existing provider connections and does not assume a model is free.
-
-See [examples/local-inference.jsonc](examples/local-inference.jsonc) for a local OpenAI-compatible endpoint. Replace its model ID with the exact ID your server exposes. Use `concurrency: 1` when a local server cannot handle two requests efficiently. Tool calling and reliable structured reports are required; a small model that cannot meet the report contract will pause the run.
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `concurrency` | `2` | Concurrent reviewers, from 1 to 8. There is still only one builder. |
-| `maxCalls` | `256` | Owned-session model-request hook admissions per activation. Upstream auxiliary work or retries can add provider requests. |
-| `steps` | `40` | Maximum agent steps per worker. |
-| `maxSlices` | `30` | Committed slices per activation. |
-| `maxFixRounds` | `5` | Build/check/review attempts per slice before pausing. |
-| `cleanAudits` | `2` | Consecutive clean final panels required. |
-| `maxHours` | `8` | Time budget per activation. Cleanup can take additional time. |
-| `workerTimeoutMinutes` | `20` | Timeout per worker. |
-| `checkTimeoutMinutes` | `20` | Timeout per validation command. |
-| `maxDiffBytes` | `300000` | Maximum candidate diff size; larger work pauses for inspection. |
-| `keepAwake` | `true` | Keep macOS awake while the run is active. |
-| `checks` | `[]` | Required list of `{name, command}` validation checks. |
-| `heavyCommand` | automatic | Optional command prefix, for example `["/path/to/gate", "--"]`. |
-
-Checks are argument arrays, for example `["npm", "test", "--", "--run"]`, not shell strings. Use commands that finish; do not configure dev servers or watch modes. Set worker limits in your test runner's supported options. Churn automatically uses `~/.local/bin/codex-heavy --` when available, and otherwise still runs checks serially. Set `heavyCommand` for another shared resource gate.
-
-Custom reviewers accept `name`, `focus`, and optional `model`. Built-in lens names can omit `focus`. Keep reports focused on the user's acceptance criteria rather than aesthetic preferences.
-
-## Stop and recover
-
-Stopping preserves partial files. Resume first confirms the saved branch and commit, settles recorded workers, and continues the slice. It does not reset your checkout. If another process changes HEAD or changes files during review, Churn pauses instead of committing an unreviewed tree.
-
-State and worker/review receipts live in the worktree's Git administrative directory, outside normal commits:
-
-```sh
-git rev-parse --git-path churn/state.json
-git rev-parse --git-common-dir
+```jsonc
+{
+  "plugins": [{
+    "package": "/absolute/path/to/opencode-goal",
+    "options": {
+      "reviewConcurrency": 1,
+      "steps": 40,
+      "workerTimeoutMinutes": 20
+    }
+  }]
+}
 ```
 
-The lock is `churn.lock` inside the reported common Git directory. One Churn run owns the repository across its worktrees. A lock left after a crash is never stolen automatically. **Restart the OpenCode service first**, inspect the checkout and saved state, and confirm the old workers, validation commands, and Git hooks are stopped. Detached commands can survive a hard service crash. Then remove only that exact stale lock and use `/churn-resume`. Do not delete state or reset files as a recovery shortcut. An uncertain worker shutdown retains the lock deliberately.
+- `reviewConcurrency`: 1–3 active reviewers, default **1**. You still get three independent reviews per round. There is always just one writer.
+- `steps`: 1–100 model steps per worker, default **40**.
+- `workerTimeoutMinutes`: 1–120 minutes per worker, default **20**.
 
-On macOS, Churn starts `/usr/bin/caffeinate -is -w <service-pid>` for the run and releases it during cleanup. This prevents idle sleep while supported by macOS; it does not defeat shutdown, a closed laptop lid, power loss, or forced sleep. Other platforms need their own power settings. The OpenCode service and model provider must remain available.
+There are at most 30 planned slices and three fixes per slice. Ten final rounds always run; this is deliberately thorough and can consume significant inference. These limits are not a token or billing cap. Model permissions remain under your OpenCode configuration; the plugin does not auto-approve prompts. Planner/reviewer agents deny editing and shell access. Writers can use normal tools to implement and run checks. Instructions prohibit commits, publishing, nested agents, and configuration changes; this is not OS-level containment.
 
-## Execution boundaries
+Tests and checks are run by the writing agent following your repository instructions, rather than by a second configurable command runner. The coordinator validates the report format and rejects reported failures; it does not independently prove the model's validation claims. Real-model quality depends on the selected model. The service must remain running; the plugin does not manage machine sleep.
 
-Planner and reviewer workers can read, glob, and grep. Builders can additionally edit project files. OpenCode's confined Code Mode `execute` dispatcher remains available, but every nested tool call is checked against the same role policy. Workers cannot run shells, launch nested agents, use network tools, or create commits. Existing permission decisions are never upgraded from ask/deny to allow. Edits to Git and OpenCode configuration are blocked.
+## Upgrading from Churn
 
-These controls are **not an operating-system security sandbox**. Validation commands and Git hooks execute repository code with your account's authority; generated edits can change that code. Use trusted repositories and an isolated machine/container when you need hostile-code containment. Reviews and tests provide evidence, not proof that every defect is absent. Submodules are currently rejected.
+Stop any v0.1 run first. Update the clone to `v0.2.0`, reinstall from the lockfile, replace all old Churn options with the configuration above, and restart OpenCode. Use `/goal` instead of `/churn`. The old `v0.1.0` release remains available.
 
 ## Development
 
 ```sh
 bun install --frozen-lockfile --minimum-release-age 86400
 npm run check
-```
-
-With the pinned CLI installed, run the native integration test:
-
-```sh
 OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
 ```
 
-This launches an isolated OpenCode server and deterministic local HTTP model provider. It verifies native tool use, permission denial, review, and Git commits without paid inference. It does not measure a real model's reasoning quality.
+`src/engine.ts` contains the loop and report contracts, `src/workers.ts` handles OpenCode sessions, and `src/index.ts` registers commands and saves progress. Tests cover ordering, convergence, cancellation, resume, concurrency, failed reports, file boundaries, and worker cleanup. The native smoke test runs all ten rounds against a local deterministic model provider, checks denied reviewer writes, and confirms no commits are created. It makes no paid model calls and does not measure real-model reasoning quality.
 
-Tests use Node's test runner with two workers. On constrained shared machines, run installs and the check command through your resource gate. See [AGENTS.md](AGENTS.md) for the module map and changes that need special care. Keep local tests, CI, native OpenCode loading, and real provider execution as separate verification claims.
+On a constrained shared machine, run installs and checks through your shared resource gate, such as `~/.local/bin/codex-heavy -- npm run check`. The test runner uses at most two workers.
 
-API references: [OpenCode V2 plugins](https://opencode.ai/v2/docs/build/plugins), [permissions](https://opencode.ai/v2/docs/permissions), and [providers](https://opencode.ai/v2/docs/providers).
+Compatibility is pinned to `@opencode-ai/plugin` and `@opencode-ai/cli` **`0.0.0-beta-19157`**. Current upstream docs can describe newer beta package names or APIs; upgrade only after running the native smoke test.
+
+References: [OpenCode V2 plugins](https://opencode.ai/v2/docs/build/plugins/), [plugin installation](https://opencode.ai/v2/docs/plugins), [permissions](https://opencode.ai/v2/docs/permissions).

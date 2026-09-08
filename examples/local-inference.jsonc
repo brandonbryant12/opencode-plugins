@@ -16,21 +16,7 @@
   "plugins": [
     {
       "package": "/absolute/path/to/opencode-churn",
-      "options": {
-        "model": "local/served-model-id",
-        "models": {
-          "planner": "local/served-model-id",
-          "builder": "local/served-model-id",
-          "reviewer": "local/served-model-id"
-        },
-        "concurrency": 1,
-        "maxCalls": 256,
-        "steps": 40,
-        "keepAwake": true,
-        "checks": [
-          { "name": "check", "command": ["npm", "run", "check"] }
-        ]
-      }
+      "options": { "reviewConcurrency": 1 }
     }
   ]
 }

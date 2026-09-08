@@ -1,130 +1,93 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFile, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { run, pool, type Runtime } from "../src/engine.ts";
-import { configure } from "../src/config.ts";
-import { repository } from "./helpers.ts";
+import { run, plan, review, work, type State, type Role } from "../src/engine.ts";
 
-const slice = { title: "Update answer", instructions: "Change answer", acceptance: ["answer is after"] };
-const next = JSON.stringify({ done: false, reason: "Answer needs correction", slice });
-const done = JSON.stringify({ done: true, reason: "Answer verified", slice: null });
-const pass = JSON.stringify({ verdict: "pass", findings: [] });
-const revise = JSON.stringify({ verdict: "revise", findings: [{ severity: "high", location: "answer.txt:1", problem: "Wrong answer", fix: "Use after" }] });
-
-async function fixture(t: test.TestContext) {
-  const repo = await repository();
-  t.after(repo.cleanup);
-  const config = configure({ reviewers: [{ name: "correctness" }], cleanAudits: 2, checks: [{ name: "answer", command: ["true"] }] });
-  let builders = 0;
-  let reviews = 0;
-  const runtime: Runtime = {
-    state: repo.state, config, signal: new AbortController().signal,
-    save: async () => {}, report: async () => {},
-    identity: () => repo.git.identity(repo.state.head, repo.state.branch),
-    snapshot: () => repo.git.snapshot(), diff: () => repo.git.diff(repo.state.base),
-    checks: async () => {
-      assert.equal(await readFile(join(repo.directory, "answer.txt"), "utf8"), "after\n");
-      return "answer passed";
-    },
-    commit: (tree, title) => repo.git.commit(tree, repo.state.head, repo.state.branch, title, repo.state.id),
-    worker: async role => {
-      if (role === "planner") return repo.state.completed.length ? done : next;
-      if (role === "builder") { builders++; await writeFile(join(repo.directory, "answer.txt"), "after\n"); return "Updated answer"; }
-      reviews++;
-      return pass;
-    },
-  };
-  return { ...repo, runtime, counts: () => ({ builders, reviews }) };
-}
-
-test("real Git: builds, checks, reviews, commits exact tree, and audits twice", async t => {
-  const f = await fixture(t);
-  await run(f.runtime);
-  assert.equal(f.state.status, "complete");
-  assert.equal(f.state.completed.length, 1);
-  assert.deepEqual(f.counts(), { builders: 1, reviews: 6 });
-  assert.equal(f.state.reviews.length, 6);
-  assert.equal(await f.git.run(["rev-parse", "HEAD^{tree}"]), f.state.completed[0].tree);
-  await f.git.clean();
-});
-test("one rejecting reviewer vetoes a slice and triggers a fresh review panel", async t => {
-  const f = await fixture(t);
-  const original = f.runtime.worker;
-  let rejected = false;
-  f.runtime.worker = async (role, prompt, model) => {
-    if (role === "reviewer" && !rejected) { rejected = true; return revise; }
-    return original(role, prompt, model);
-  };
-  await run(f.runtime);
-  assert.equal(f.counts().builders, 2);
-  assert.equal(f.state.completed.length, 1);
-});
-test("failing checks go back to builder; no commit happens before success", async t => {
-  const f = await fixture(t);
-  const original = f.runtime.checks;
-  let count = 0;
-  f.runtime.checks = async () => { if (++count === 1) throw new Error("Expected after"); return original(); };
-  await run(f.runtime);
-  assert.equal(f.counts().builders, 2);
-  assert.equal(f.state.completed.length, 1);
-});
-test("malformed reviewer output never authorizes a commit", async t => {
-  const f = await fixture(t);
-  const original = f.runtime.worker;
-  f.runtime.worker = async (role, prompt, model) => role === "reviewer" ? "Looks good!" : original(role, prompt, model);
-  await assert.rejects(run(f.runtime));
-  assert.equal(await f.git.head(), f.state.base);
-  assert.equal(f.state.completed.length, 0);
-});
-test("review mutation invalidates the entire panel", async t => {
-  const f = await fixture(t);
-  const original = f.runtime.worker;
-  f.runtime.worker = async (role, prompt, model) => {
-    if (role === "reviewer") await writeFile(join(f.directory, "answer.txt"), "tampered\n");
-    return original(role, prompt, model);
-  };
-  await assert.rejects(run(f.runtime), /changed during read-only review/);
-  assert.equal(await f.git.head(), f.state.base);
-});
-test("persistent findings reach the repair limit with partial work preserved", async t => {
-  const f = await fixture(t);
-  f.runtime.config.maxFixRounds = 2;
-  const original = f.runtime.worker;
-  f.runtime.worker = async (role, prompt, model) => role === "reviewer" ? revise : original(role, prompt, model);
-  await assert.rejects(run(f.runtime), /without convergence/);
-  assert.equal(f.counts().builders, 2);
-  assert.equal(await f.git.head(), f.state.base);
-  assert.equal(await readFile(join(f.directory, "answer.txt"), "utf8"), "after\n");
-});
-test("a no-op builder pauses instead of claiming completion", async t => {
-  const f = await fixture(t);
-  const original = f.runtime.worker;
-  f.runtime.worker = async (role, prompt, model) => role === "builder" ? "Done" : original(role, prompt, model);
-  await assert.rejects(run(f.runtime), /made no changes/);
-  assert.equal(f.state.completed.length, 0);
-});
-test("abort after checks cannot commit", async t => {
-  const f = await fixture(t);
+const validPlan = JSON.stringify({ slices: [{ title: "First", task: "Do first", acceptance: ["First works"] }, { title: "Second", task: "Do second", acceptance: ["Second works"] }] });
+const pass = JSON.stringify({ summary: "Checked", checks: [{ command: "npm test", result: "pass", evidence: "Tests passed" }], blocked: [], decisions: [] });
+const clean = '{"findings":[]}';
+const defect = '{"findings":[{"location":"a.ts:3","problem":"Off by one; fix the bound"}]}';
+function harness(concurrency = 1) {
+  const state: State = { version: 2, goal: "A small goal", status: "running", phase: "", reason: "", outputs: {}, active: [] };
+  const calls: { role: Role; prompt: string; phase: string }[] = [];
   const controller = new AbortController();
-  f.runtime.signal = controller.signal;
-  f.runtime.checks = async () => { controller.abort(); return "pass"; };
-  await assert.rejects(run(f.runtime));
-  assert.equal(await f.git.head(), f.state.base);
+  let respond = async (role: Role, _prompt: string) => role === "planner" ? validPlan : role === "reviewer" ? clean : pass;
+  const r = { state, concurrency, signal: controller.signal, save: async () => {}, report: async () => {}, worker: async (role: Role, prompt: string) => { calls.push({ role, prompt, phase: state.phase }); return respond(role, prompt); } };
+  return { r, state, calls, controller, response: (fn: typeof respond) => { respond = fn; } };
+}
+test("two slices each get an implementer and reviewer, then exactly ten three-plus-one rounds", async () => {
+  const h = harness(); await run(h.r);
+  assert.equal(h.state.status, "complete");
+  assert.deepEqual(h.calls.slice(0, 5).map(c => c.role), ["planner", "implementer", "reviewer", "implementer", "reviewer"]);
+  assert.equal(h.calls.length, 45);
+  for (let i = 5; i < h.calls.length; i += 4) assert.deepEqual(h.calls.slice(i, i + 4).map(c => c.role), ["reviewer", "reviewer", "reviewer", "evaluator"]);
+  assert.ok(h.calls.slice(5).every(c => c.prompt.includes('"First"') && c.prompt.includes('"Second"')));
 });
-test("pool bounds concurrency and settles peers before throwing", async () => {
-  let active = 0;
-  let maximum = 0;
-  let finished = 0;
-  await assert.rejects(pool([0, 1, 2], 2, async value => {
-    active++; maximum = Math.max(maximum, active);
-    try { if (value === 0) throw new Error("fail"); await new Promise(r => setTimeout(r, 20)); finished++; }
-    finally { active--; }
-  }), /fail/);
-  assert.equal(active, 0);
-  assert.equal(finished, 1);
-  assert.equal(maximum, 1);
-  let concurrent = 0;
-  await pool([0, 1, 2, 3, 4], 2, async () => { active++; concurrent = Math.max(concurrent, active); await new Promise(r => setTimeout(r, 5)); active--; });
-  assert.equal(concurrent, 2);
+test("slice findings trigger a fix and fresh review before the next implementation", async () => {
+  const h = harness(); let reviewed = false;
+  h.response(async role => {
+    if (role === "planner") return validPlan;
+    if (role === "reviewer" && !reviewed) { reviewed = true; return defect; }
+    if (role === "reviewer") return clean;
+    if (h.state.phase.includes("/fix/")) return JSON.stringify({ ...JSON.parse(pass), decisions: [{ id: "0", action: "fixed", reason: "Boundary corrected" }] });
+    return pass;
+  });
+  await run(h.r);
+  assert.deepEqual(h.calls.slice(0, 6).map(c => c.role), ["planner", "implementer", "reviewer", "evaluator", "reviewer", "implementer"]);
+});
+test("persistent slice findings pause after three fixes", async () => {
+  const h = harness(); h.response(async role => role === "planner" ? validPlan : role === "reviewer" ? defect : JSON.stringify({ ...JSON.parse(pass), decisions: [{ id: "0", action: "fixed", reason: "Attempted" }] }));
+  await assert.rejects(run(h.r), /three fixes/);
+  assert.equal(h.calls.filter(c => c.role === "evaluator").length, 3);
+  assert.ok(!h.calls.some(c => c.phase.startsWith("round/")));
+});
+test("review panel respects concurrency and settles readers before evaluator", async () => {
+  const h = harness(2); let active = 0; let peak = 0;
+  h.response(async role => {
+    if (role === "planner") return validPlan;
+    if (role === "reviewer") {
+      active++; peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 2)); active--; return clean;
+    }
+    assert.equal(active, 0); return pass;
+  });
+  await run(h.r); assert.equal(peak, 2);
+});
+test("a failed reader settles its sibling and never admits the evaluator", async () => {
+  const h = harness(2); let settled = false; let n = 0;
+  h.response(async role => {
+    if (role === "planner") return validPlan;
+    if (role === "reviewer" && h.state.phase.startsWith("round/")) {
+      if (++n === 1) throw new Error("Reader failed");
+      await new Promise(resolve => setTimeout(resolve, 5)); settled = true;
+    }
+    return role === "reviewer" ? clean : pass;
+  });
+  await assert.rejects(run(h.r), /Reader failed/);
+  assert.equal(settled, true); assert.equal(h.calls.filter(c => c.role === "evaluator").length, 0);
+});
+test("resume reuses completed tasks and retries only the interrupted worker", async () => {
+  const h = harness(); let fail = true;
+  h.response(async role => { if (h.state.phase === "round/4/evaluate" && fail) throw new Error("Interrupted"); return role === "planner" ? validPlan : role === "reviewer" ? clean : pass; });
+  await assert.rejects(run(h.r), /Interrupted/); const count = h.calls.length;
+  fail = false; await run(h.r);
+  assert.equal(h.calls[count].phase, "round/4/evaluate");
+  assert.equal(h.calls.filter(c => c.role === "implementer").length, 2);
+  assert.equal(h.state.status, "complete");
+});
+test("cancellation cannot checkpoint a worker result or complete the run", async () => {
+  const h = harness(); h.response(async () => { h.controller.abort(); return validPlan; });
+  await assert.rejects(run(h.r)); assert.deepEqual(h.state.outputs, {}); assert.notEqual(h.state.status, "complete");
+});
+test("malformed plans, contradictory validation, and unaccounted findings fail closed", () => {
+  assert.throws(() => plan('{"slices":[]}'));
+  assert.throws(() => review('{"findings":[{}]}'));
+  assert.throws(() => work(pass.replace('"pass"', '"fail"')));
+  assert.throws(() => work(pass.replace('"blocked":[]', '"blocked":["Missing credentials"]')));
+  assert.throws(() => work(pass, [{ id: "1", location: "a", problem: "broken" }]));
+});
+test("round evaluator must account for all three reviewers even when defects duplicate", async () => {
+  const h = harness(); h.response(async role => role === "planner" ? validPlan : role === "reviewer" ? (h.state.phase.startsWith("round/") ? defect : clean) : pass);
+  await assert.rejects(run(h.r), /every finding/);
+  assert.equal(h.state.outputs["round/1/evaluate"], undefined);
+  assert.notEqual(h.state.status, "complete");
 });
