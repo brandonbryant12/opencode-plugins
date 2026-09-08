@@ -1,16 +1,19 @@
+import { swarm } from "./swarm.ts";
 export type Slice = { title: string; task: string; acceptance: string[] };
 export type Finding = { id: string; location: string; problem: string };
-export type Role = "planner" | "implementer" | "reviewer" | "evaluator";
+export type Role = "planner" | "implementer" | "reviewer" | "evaluator" | "verifier" | "meta";
+export type WorkerStats = { role: Role; phase: string; startedAt: number; input?: number; output?: number; cost?: number };
 export type State = {
-  version: 2; goal: string; status: "running" | "paused" | "complete";
+  version: 2; mode?: "goal" | "swarm" | "proposal"; proposalPath?: string; goal: string; status: "running" | "paused" | "complete";
   phase: string; reason: string; outputs: Record<string, string>; active: string[];
+  telemetry?: { parentID: string; startedAt: number; updatedAt: number; workers: Record<string, WorkerStats> };
 };
 export interface Runtime {
   state: State;
   concurrency: number;
   signal: AbortSignal;
   save(): Promise<void>;
-  worker(role: Role, task: string): Promise<string>;
+  worker(role: Role, task: string, phase?: string): Promise<string>;
   report(text: string): Promise<void>;
 }
 
@@ -26,7 +29,6 @@ export const focuses = [
   "Simplicity and maintainability",
   "Final acceptance and regressions",
 ];
-const perspectives = ["Trace normal execution and contracts", "Challenge assumptions with concrete failure cases", "Look for omissions and the smallest simpler solution"];
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a JSON object");
@@ -42,15 +44,18 @@ export function json(raw: string): Record<string, unknown> {
 }
 export function plan(raw: string): Slice[] {
   const p = json(raw);
-  if (!Array.isArray(p.slices) || !p.slices.length || p.slices.length > 30) throw new Error("Plan needs 1–30 slices");
+  if (!Array.isArray(p.slices) || !p.slices.length || p.slices.length > 120) throw new Error("Plan needs 1–120 slices");
   return p.slices.map(value => {
     const s = object(value);
     if (!Array.isArray(s.acceptance) || !s.acceptance.length) throw new Error("Every slice needs acceptance criteria");
-    return { title: text(s.title), task: text(s.task), acceptance: s.acceptance.map(text) };
+    const slice = { title: text(s.title), task: text(s.task), acceptance: s.acceptance.map(text) };
+    if (slice.title.length > 200 || JSON.stringify(slice).length > 6000) throw new Error("Keep each slice under 6000 characters with a short title");
+    return slice;
   });
 }
 export function review(raw: string): Finding[] {
   const r = json(raw);
+  if (r.blocked !== undefined && (!Array.isArray(r.blocked) || r.blocked.length)) throw new Error("Review reported blocked evidence");
   if (!Array.isArray(r.findings) || r.findings.length > 20) throw new Error("Review needs at most 20 findings");
   return r.findings.map((value, i) => {
     const f = object(value);
@@ -67,7 +72,7 @@ export function work(raw: string, findings: Finding[] = []): string {
     text(check.command); text(check.evidence);
     if (check.result !== "pass") throw new Error(`Validation did not pass: ${check.command}`);
   }
-  if (findings.length) {
+  {
     if (!Array.isArray(r.decisions) || r.decisions.length !== findings.length) throw new Error("Account for every finding exactly once");
     const remaining = new Set(findings.map(f => f.id));
     for (const value of r.decisions) {
@@ -80,7 +85,7 @@ export function work(raw: string, findings: Finding[] = []): string {
 }
 
 export const workContract = `Return only JSON: {"summary":"concise changes and evidence","checks":[{"command":"check actually performed","result":"pass","evidence":"observed result"}],"blocked":[],"decisions":[{"id":"finding id","action":"fixed or rejected","reason":"evidence"}]}. Report failures honestly in blocked; never mark an unrun check pass. Account for each supplied finding once. Reject unsupported or out-of-scope findings with evidence. Run relevant checks after edits, following repository resource limits. No changes are required when the goal already holds.`;
-const reviewContract = `Return only JSON: {"findings":[{"location":"slice title and file:line","problem":"concrete defect, evidence and smallest correction"}]}. Empty findings is valid. Read files, trace behavior, and check available validation evidence. Stay within the original goal. Do not manufacture issues or request speculative abstractions. Do not edit files or execute shell commands.`;
+export const reviewContract = `Return only JSON: {"findings":[{"location":"slice title and file:line","problem":"concrete defect, evidence and smallest correction"}]}. Empty findings is valid. Read files, trace behavior, and check available validation evidence. Stay within the original goal. Do not manufacture issues or request speculative abstractions. Do not edit files or execute shell commands.`;
 
 // Every worker starts fresh. Only the plan and relevant reports cross sessions.
 // Saved successful outputs are checkpoints; errors never become successes.
@@ -92,40 +97,26 @@ export async function run(r: Runtime) {
     s.phase = key;
     await r.save();
     await r.report(key);
-    const raw = await r.worker(role, `Original goal:\n${s.goal}\n\n${prompt}`);
+    const raw = await r.worker(role, `${key === "plan" ? `Mode: ${s.mode ?? "goal"}. ${s.mode === "proposal" ? `Source proposal: ${s.proposalPath}. Catalog its design sections; do not implement software.` : ""}\nOriginal goal:\n${s.goal}` : `Original objective is saved in .opencode/goal/objective.md (read only if needed). Mode: ${s.mode ?? "goal"}. ${s.mode === "proposal" ? `Only improve the proposal ${s.proposalPath}; do not implement the proposed software.` : ""}`}\n\n${prompt}`, key);
     r.signal.throwIfAborted();
     const result = parse(raw);
     s.outputs[key] = raw;
     await r.save();
     return result;
   }
-  const slices = await call("plan", "planner", 'Read project instructions and relevant code. Turn the goal or supplied document into an ordered, bounded plan. Preserve explicit requirements and dependencies. Prefer few small slices; do not expand scope. Return only JSON: {"slices":[{"title":"short title","task":"what to implement and relevant paths","acceptance":["observable result"]}]}. Do not edit files.', plan);
-  for (let i = 0; i < slices.length; i++) {
+  const slices = await call("plan", "planner", 'Read project instructions and relevant code. Turn the goal or supplied document into an ordered, bounded plan of at most 120 concise slices; preserve all requirements. In swarm mode catalog existing work; in proposal mode catalog design sections and decision criteria, not implementation tasks. Preserve explicit requirements and dependencies. Prefer few small slices; do not expand scope. Return only JSON: {"slices":[{"title":"short title","task":"what to implement and relevant paths","acceptance":["observable result"]}]}. Do not edit files.', plan);
+  if (!s.mode || s.mode === "goal") for (let i = 0; i < slices.length; i++) {
     const context = `Current slice ${i + 1}/${slices.length}:\n${JSON.stringify(slices[i])}\nEarlier slice titles: ${slices.slice(0, i).map(s => s.title).join("; ")}`;
     await call(`slice/${i + 1}/implement`, "implementer", `${context}\nImplement this slice only. Inspect existing partial edits before continuing. ${workContract}`, work);
     for (let attempt = 0; ; attempt++) {
       const findings = await call(`slice/${i + 1}/review/${attempt}`, "reviewer", `${context}\nImplementation evidence:\n${s.outputs[`slice/${i + 1}/${attempt ? `fix/${attempt}` : "implement"}`]}\n${reviewContract}`, review);
       if (!findings.length) break;
-      if (attempt >= 3) throw new Error(`Slice ${i + 1} still has findings after three fixes. Inspect the worker sessions.`);
+      if (attempt >= 3) { delete s.outputs[`slice/${i + 1}/review/${attempt}`]; await r.save(); throw new Error(`Slice ${i + 1} still has findings after three fixes. Inspect the worker sessions.`); }
       await call(`slice/${i + 1}/fix/${attempt + 1}`, "evaluator", `${context}\nEvaluate these findings and make justified corrections:\n${JSON.stringify(findings)}\n${workContract}`, raw => work(raw, findings));
     }
   }
-  for (let round = 0; round < focuses.length; round++) {
-    const evidence = round ? s.outputs[`round/${round}/evaluate`] : s.outputs[`slice/${slices.length}/implement`];
-    const context = `Review round ${round + 1}/10: ${focuses[round]}. Walk through EVERY slice in order, then check their integration:\n${JSON.stringify(slices)}\nLatest available work report (verify its claims against current code):\n${evidence}`;
-    const reports: Finding[][] = [];
-    // Settle every reader before admitting the fourth, writing agent.
-    for (let start = 0; start < 3; start += r.concurrency) {
-      const batch = await Promise.allSettled(perspectives.slice(start, start + r.concurrency).map((perspective, offset) =>
-        call(`round/${round + 1}/review/${start + offset + 1}`, "reviewer", `${context}\nYour independent perspective: ${perspective}.\n${reviewContract}`, review)));
-      const failure = batch.find(result => result.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
-      reports.push(...batch.map(result => (result as PromiseFulfilledResult<Finding[]>).value));
-    }
-    const findings = reports.flatMap((report, reviewer) => report.map(f => ({ ...f, id: `${reviewer + 1}:${f.id}` })));
-    await call(`round/${round + 1}/evaluate`, "evaluator", `${context}\nYou are the fourth agent. Evaluate all three independent reviews, deduplicate their findings, reject unsupported suggestions, and implement the smallest justified improvements. Verify the original goal and all acceptance criteria, including when there are no findings.\nFindings:\n${JSON.stringify(findings)}\n${workContract}`, raw => work(raw, findings));
-  }
+  await swarm(r, slices, call);
   s.status = "complete";
-  s.reason = `All slices reviewed; ten review/evaluation rounds finished with reported passing checks.\n${work(s.outputs["round/10/evaluate"])}`;
+  s.reason = "Ten rounds completed with explicit coverage, independent verification, and meta reports. See .opencode/goal/report.md for evidence and limitations.";
   await r.save();
 }

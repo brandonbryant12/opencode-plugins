@@ -15,7 +15,7 @@
   },
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-churn",
+      "package": "/absolute/path/to/opencode-plugins",
       "options": { "reviewConcurrency": 1 }
     }
   ]

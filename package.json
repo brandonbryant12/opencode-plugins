@@ -1,12 +1,12 @@
 {
-  "name": "opencode-churn",
-  "version": "0.2.0",
-  "description": "A simple /goal loop for OpenCode 2: implement slices, review, fix, and run ten focused review rounds.",
+  "name": "opencode-plugins",
+  "version": "0.3.0",
+  "description": "Goal and adversarial Swarm workflows with live progress for OpenCode 2.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/brandonbryant12/opencode-churn.git"
+    "url": "git+https://github.com/brandonbryant12/opencode-plugins.git"
   },
   "keywords": [
     "opencode",
@@ -16,7 +16,8 @@
     "code-review"
   ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
   },
   "files": [
     "index.ts",
@@ -24,22 +25,45 @@
     "README.md",
     "LICENSE",
     "examples",
-    "bunfig.toml"
+    "bunfig.toml",
+    "tui.tsx",
+    "docs"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test --test-concurrency=2 test/*.test.ts",
     "test:native": "node --experimental-strip-types scripts/native-smoke.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "test:tui": "bun --preload @opentui/solid/preload scripts/tui-smoke.tsx"
   },
   "dependencies": {
     "@opencode-ai/plugin": "0.0.0-beta-19157"
   },
   "devDependencies": {
+    "@opencode-ai/theme": "0.0.0-beta-19157",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
     "@types/node": "24.3.0",
+    "solid-js": "1.9.12",
     "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=22.18.0"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   }
 }

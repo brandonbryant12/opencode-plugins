@@ -27,7 +27,12 @@ jobs:
         run: bun install --frozen-lockfile --minimum-release-age 86400
       - name: Typecheck and test
         run: npm run check
+      - name: Test live progress components
+        run: npm run test:tui
       - name: Install age-eligible OpenCode 2 runtime
         run: bun add --global --trust --minimum-release-age 86400 @opencode-ai/cli@0.0.0-beta-19157
       - name: Test actual native plugin loading and execution
-        run: OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
+        run: |
+          OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
+          GOAL_SMOKE_MODE=swarm OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
+          GOAL_SMOKE_MODE=proposal OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
