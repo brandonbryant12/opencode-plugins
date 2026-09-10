@@ -15,7 +15,7 @@ export function phaseLabel(phase: string) {
   const [, kind, n, action] = phase.match(/^(slice|round)\/(\d+)\/(\w+)(?:\/(\d+))?$/) ?? [];
   return kind ? `${verbs[action] ?? action} ${kind} ${n}` : phase;
 }
-export function progress(state: State | undefined, live: SessionInfo[] = [], running = false) {
+export function progress(state: State | undefined, live: SessionInfo[] = [], running = false, stopping = false) {
   if (!state) return null;
   const outputs = state.outputs;
   const entries = records(state);
@@ -36,27 +36,28 @@ export function progress(state: State | undefined, live: SessionInfo[] = [], run
   const workers = { ...state.telemetry?.workers };
   for (const session of live) if (workers[session.id]) workers[session.id] = { ...workers[session.id], ...usage(session) };
   const stats = Object.values(workers);
-  const status = state.status === "running" && !running ? "paused" : state.status;
+  const status = state.status === "running" ? !running ? "paused" : stopping ? "stopping" : "running" : state.status;
   return {
     mode: state.mode ?? "goal",
-    meta: keys.filter(k => k.endsWith("/meta")).map(k => byKey.get(k)!).at(-1),
+    meta: keys.filter(k => k.endsWith("/meta")).map(k => byKey.get(k)!).at(-1) ?? null,
     verifications: keys.filter(k => k.includes("/verify/") && (byKey.get(k)?.findings as unknown[] | undefined)?.length === 0).length,
     fixed: keys.filter(k => k.endsWith("/evaluate") || k.includes("/fix/") || k.includes("/metafix/")).flatMap(k => (byKey.get(k)!.decisions ?? []) as { action: string }[]).filter(d => d.action === "fixed").length,
     rejected: keys.filter(k => k.endsWith("/evaluate") || k.includes("/fix/") || k.includes("/metafix/")).flatMap(k => (byKey.get(k)!.decisions ?? []) as { action: string }[]).filter(d => d.action === "rejected").length,
     parentID: state.telemetry?.parentID ?? null,
     title: state.goal.trim().split("\n")[0].slice(0, 120), status,
-    phase: phaseLabel(state.phase), slices, rounds,
+    phase: status === "complete" ? "All ten review rounds complete" : phaseLabel(state.phase), slices, rounds,
     tasks: keys.filter(k => !/^round\/\d+\/meta$/.test(k)).length,
     reviews: keys.filter(key => key.includes("/review/")).length,
     fixes: keys.filter(key => key.includes("/fix/") || key.includes("/metafix/")).length,
     active: state.active.map(id => ({ id, ...workers[id], phase: phaseLabel(workers[id]?.phase ?? state.phase) })),
+    lastWorker: Object.keys(workers).at(-1) ?? null,
     startedAt: state.telemetry?.startedAt ?? null,
     updatedAt: state.telemetry?.updatedAt ?? null,
     input: stats.reduce((sum, s) => sum + (s.input ?? 0), 0),
     output: stats.reduce((sum, s) => sum + (s.output ?? 0), 0),
     cost: stats.reduce((sum, s) => sum + (s.cost ?? 0), 0),
-    usageAvailable: !!state.telemetry && stats.every(s => s.cost !== undefined),
-    message: !running && state.status === "running" ? "Run is not active. Use /goal-resume to continue." : state.reason.slice(0, 600),
+    usageAvailable: !!state.telemetry && stats.length > 0 && stats.every(s => s.cost !== undefined),
+    message: !running && state.status === "running" ? "Coordinator is not active. Saved workers may still need to stop. Use /goal-resume to settle them and continue, or /goal-stop to stop them." : state.reason.slice(0, 600),
   };
 }
 export type Progress = NonNullable<ReturnType<typeof progress>>;

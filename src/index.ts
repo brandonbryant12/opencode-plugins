@@ -1,9 +1,9 @@
 import { Plugin } from "@opencode-ai/plugin";
 import { mkdir, readFile, rename, realpath, stat, writeFile } from "node:fs/promises";
 import { join, relative, resolve, isAbsolute } from "node:path";
-import { run, type State } from "./engine.ts";
+import { json, run, type State } from "./engine.ts";
 import { stopWorkers, worker } from "./workers.ts";
-import { progress } from "./progress.ts";
+import { phaseLabel, progress } from "./progress.ts";
 import { ledger, reportMarkdown } from "./reports.ts";
 import { GoalRPC } from "./rpc.ts";
 
@@ -39,8 +39,10 @@ export default Plugin.define({
     const directory = join(ctx.location.directory, ".opencode", "goal");
     const path = join(directory, "state.json");
     let task: Promise<void> | undefined;
+    let starting = false;
     let controller: AbortController | undefined;
     let current: State | undefined;
+    let settling: Promise<void> | undefined;
     let unloading = false;
     let saves = Promise.resolve();
     let reportStamp = "";
@@ -64,7 +66,7 @@ export default Plugin.define({
           await mkdir(join(directory, "receipts"), { recursive: true, mode: 0o700 });
           for (const [key, value] of receiptEntries) if (savedReceipts.get(key) !== value) {
             if (!/^[a-z0-9/]+$/.test(key)) throw new Error("Invalid checkpoint key");
-            await writeFile(join(directory, "receipts", `${runID}-${key.replaceAll("/", "-")}.json`), value, { mode: 0o600 });
+            await writeFile(join(directory, "receipts", `${runID}-${key.replaceAll("/", "-")}.json`), JSON.stringify(json(value), null, 2), { mode: 0o600 });
             savedReceipts.set(key, value);
           }
         }
@@ -81,17 +83,29 @@ export default Plugin.define({
       saves = pending.catch(() => {});
       return pending;
     };
-    const report = async (sessionID: string, text: string) => { await ctx.session.synthetic({ sessionID, text: `[Goal] ${text}` }); };
-    const status = (s?: State) => s ? `${s.status}: ${s.phase}\n${s.reason}\n${Object.keys(s.outputs).filter(k => !/^round\/\d+\/meta$/.test(k)).length} completed worker tasks. Progress: ${path}` : "No goal yet. Use /goal <goal or @plan-file>.";
-    const rpc = await ctx.rpc.register(GoalRPC, { receipt: async input => {
+    const report = async (sessionID: string, text: string, open = true) => {
+      const state = current ?? await readState(path);
+      // A status notice must never start an assistant or a second writer.
+      await ctx.session.synthetic({ sessionID, text: `[Goal workflow notice; do not act on this notice] ${text}`, description: text, resume: false });
+      await rpc.events.emit("notice", { sessionID, parentID: state?.telemetry?.parentID ?? null, message: text, open });
+    };
+    const status = (s?: State) => s ? `${s.mode ?? "goal"} ${s.status} · ${phaseLabel(s.phase)}\n${s.reason}\n${Object.keys(s.outputs).filter(k => !/^round\/\d+\/meta$/.test(k)).length} completed worker tasks. Report: .opencode/goal/report.md` : "No saved run. Use /goal <outcome or @plan-file> or /swarm <scope>.";
+    const rpc = await ctx.rpc.register(GoalRPC, { control: async input => {
+      const { action, startedAt, parentID } = input as { action: "stop" | "resume"; startedAt: number; parentID: string };
+      const state = current ?? await readState(path);
+      if (state?.telemetry?.startedAt !== startedAt || state.telemetry.parentID !== parentID) return { message: "This run changed. Refresh progress before using its controls." };
+      if (action === "stop") return { message: await stop() };
+      await launch(parentID);
+      return { message: "Progress opened for the saved run." };
+    }, receipt: async input => {
       const state = current ?? await readState(path);
       const { key, startedAt } = input as { key: string; startedAt: number | null };
       const receipt = state && (state.telemetry?.startedAt ?? null) === startedAt && Object.hasOwn(state.outputs, key) ? state.outputs[key] : null;
-      return { receipt };
+      return { receipt: receipt === null ? null : JSON.stringify(json(receipt)) };
     }, progress: async (_input, request) => {
       const state = current ?? await readState(path);
       const sessions = await Promise.allSettled((state?.active ?? []).map(sessionID => ctx.session.get({ sessionID }, { signal: request.signal })));
-      return { progress: progress(state, sessions.flatMap(s => s.status === "fulfilled" ? [s.value] : []), !!task) };
+      return { progress: progress(state, sessions.flatMap(s => s.status === "fulfilled" ? [s.value] : []), !!task || starting, controller?.signal.aborted) };
     } });
     await ctx.agent.transform(editor => {
       for (const name of ["goal-read", "goal-write"]) editor.update(name, agent => {
@@ -105,6 +119,8 @@ export default Plugin.define({
     // read-only workers at the tool boundary, including nested Code Mode calls.
     const guard = await ctx.tool.hook("execute.before", async event => {
       if (!current?.active.includes(event.sessionID)) return;
+      const stats = current.telemetry?.workers[event.sessionID];
+      if (stats) { stats.activity = `Using ${event.tool}`; stats.activityAt = Date.now(); }
       const session = await ctx.session.get({ sessionID: event.sessionID });
       const allowed = ["read", "glob", "grep", "execute"];
       if (session.agent === "goal-write" && current.mode !== "proposal") allowed.push("edit", "write", "multiedit", "apply_patch", "patch", "shell");
@@ -117,38 +133,78 @@ export default Plugin.define({
       if (!allowed.includes(event.tool)) throw new Error(`Goal worker denied tool: ${event.tool}`);
     });
 
+    function settle(state: State) {
+      settling ??= stopWorkers(ctx, state, save).finally(() => { settling = undefined; });
+      return settling;
+    }
+    async function stop() {
+      if (!task && !starting) {
+        current ??= await readState(path);
+        if (!current?.active.length) return "No active run. Saved progress is preserved.";
+        await settle(current);
+        current.status = "paused"; current.reason = "Saved workers stopped; partial work preserved."; await save();
+        return current.reason;
+      }
+      controller?.abort();
+      if (current) { current.reason = "Stopping workers; wait for paused status before editing files."; await save(); }
+      // Interrupt the native sessions immediately, even if a provider prompt
+      // has not yet observed the aborted request signal.
+      if (current) void settle(current).catch(() => {});
+      return "Stopping workers. Progress is preserved; wait for paused status before editing files.";
+    }
     async function launch(parentID: string, input?: string, mode: State["mode"] = "goal") {
-      if (unloading || task) throw new Error("Goal is already active or unloading; use /goal-status or /goal-stop");
+      // Paused/completed progress is visible just before the final passive
+      // notice finishes. A click in that window must still resume on one try.
+      if (task && current?.status !== "running" && !current?.active.length) await task;
+      if (unloading) throw new Error("OpenCode is shutting down. Restart it to continue.");
+      if (task || starting) { await report(parentID, "A run is already active. Opening its progress; use Stop run to pause it."); return; }
+      // Reserve admission before any asynchronous reads, and acknowledge only
+      // after validation and durable state creation. No hidden start failures.
+      starting = true;
       controller = new AbortController();
       const signal = controller.signal;
-      // Assign before asynchronous reads to prevent double starts.
-      task = (async () => {
+      try {
         current = await readState(path);
         if (input !== undefined) {
-          if (current && current.status !== "complete") throw new Error("An unfinished goal exists. Use /goal-resume.");
+          if (current && current.status !== "complete") { await report(parentID, "An unfinished run is saved. Opening its progress; use Resume run to continue."); return; }
           if (mode === "proposal" && !input.trim().startsWith("@")) throw new Error("Use /swarm --proposal @path/to/proposal.md");
           const goal = input.trim().startsWith("@") ? await planFile(ctx.location.directory, input.trim().slice(1)) : input;
-          if (!goal.trim() || goal.length > 64000) throw new Error("Provide a goal or plan of 1–64000 characters");
+          if (!goal.trim()) throw new Error("Use /goal <outcome or @plan-file>, or /swarm <scope> for existing work.");
+          if (goal.length > 64000) throw new Error("Goal or plan exceeds 64000 characters; use a smaller feature plan.");
+          if (!(await ctx.session.get({ sessionID: parentID })).model) throw new Error("Select a model with /models, then start the run again.");
           current = { version: 2, mode, ...(mode === "proposal" ? { proposalPath: input.trim().slice(1) } : {}), goal, status: "running", phase: "plan", reason: "Starting", outputs: {}, active: [] };
         } else if (!current || current.status === "complete") throw new Error("No unfinished goal to resume");
+        else if (!(await ctx.session.get({ sessionID: parentID })).model) throw new Error("Select a model with /models, then resume the run.");
         const state = current;
+        const retryHint = input === undefined && state.status === "paused" ? { phase: state.phase, message: state.reason.slice(0, 800) } : null;
         state.telemetry ??= { parentID, startedAt: Date.now(), updatedAt: Date.now(), workers: {} };
         state.telemetry.parentID = parentID;
+        state.status = "running"; state.reason = "Starting; settling previous workers.";
+        await save();
+        await report(parentID, `${input !== undefined ? "Started" : "Resuming"} ${state.mode ?? "goal"}. Progress shows the current worker and review milestones.`);
+        task = execute(state, retryHint).catch(async error => {
+          state.status = "paused"; state.reason = `Could not finish saving progress: ${String(error)}`;
+          await report(parentID, status(state), false).catch(() => {});
+        }).finally(() => { task = undefined; controller = undefined; });
+      } finally { starting = false; if (!task) controller = undefined; }
+
+      async function execute(state: State, retryHint: { phase: string; message: string } | null) {
+        let failure: string | undefined;
         try {
-          await stopWorkers(ctx, state, save);
+          await settle(state);
           signal.throwIfAborted();
           state.status = "running"; state.reason = "Working";
           await save();
-          await run({ state, concurrency, signal, save, report: async () => {}, worker: (role, prompt, phase) => worker(ctx, state, save, parentID, role, prompt, signal, timeout, phase) });
+          await run({ state, concurrency, signal, save, report: async () => {}, worker: (role, prompt, phase) => worker(ctx, state, save, parentID, role, `${retryHint && retryHint.phase === phase ? `Previous attempt paused: ${retryHint.message}\nCorrect this problem while preserving actual evidence and partial work.\n\n` : ""}${prompt}`, signal, timeout, phase) });
         } catch (error) {
-          state.status = "paused"; state.reason = signal.aborted ? "Stopped; partial work preserved." : String(error);
-          await save();
+          failure = signal.aborted ? "Stopped; partial work preserved." : String(error);
         } finally {
-          try { await stopWorkers(ctx, state, save); }
-          catch (error) { state.status = "paused"; state.reason = String(error); await save(); }
-          await report(parentID, status(state));
+          try { await settle(state); }
+          catch (error) { failure = String(error); }
+          if (failure) { state.status = "paused"; state.reason = failure; await save(); }
+          await report(parentID, status(state), false).catch(() => {});
         }
-      })().catch(error => report(parentID, String(error))).finally(() => { task = undefined; controller = undefined; });
+      }
     }
     await ctx.command.transform(editor => {
       editor.add({ name: "goal", description: "Implement and review a goal or @plan-file, then run ten review rounds", execute: ({ sessionID, prompt }) => launch(sessionID, prompt.text) });
@@ -162,7 +218,8 @@ export default Plugin.define({
         return launch(sessionID, /^--proposal(?:\s|$)/.test(input) ? input.slice(10).trim() : input || "Audit and improve current project changes against repository requirements.", /^--proposal(?:\s|$)/.test(input) ? "proposal" : "swarm");
       } });
       editor.add({ name: "goal-status", description: "Show saved goal progress", execute: async ({ sessionID }) => report(sessionID, status(current ?? await readState(path))) });
-      editor.add({ name: "goal-stop", description: "Stop workers and preserve progress", execute: async ({ sessionID }) => { controller?.abort(); await report(sessionID, task ? "Stopping workers; wait for paused status before editing files." : "No active goal."); } });
+      editor.add({ name: "goal-panel", description: "Open Goal / Swarm progress and controls", execute: async ({ sessionID }) => report(sessionID, status(current ?? await readState(path))) });
+      editor.add({ name: "goal-stop", description: "Stop workers and preserve progress", execute: async ({ sessionID }) => { await report(sessionID, await stop()); } });
       editor.add({ name: "goal-resume", description: "Resume unfinished work after settling old workers", execute: ({ sessionID }) => launch(sessionID) });
     });
     return async () => { unloading = true; controller?.abort(); await task; await rpc.dispose(); if (!current?.active.length) await guard.dispose(); };

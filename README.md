@@ -22,7 +22,7 @@ Requires Git, Bun, and a provider configured in OpenCode. Compatibility is pinne
 bun add --global --trust --minimum-release-age 86400 @opencode-ai/cli@0.0.0-beta-19157
 export PATH="$HOME/.bun/bin:$PATH"
 opencode2 --version
-git clone --branch v0.3.0 --depth 1 https://github.com/brandonbryant12/opencode-plugins.git "$HOME/opencode-plugins"
+git clone --branch v0.3.1 --depth 1 https://github.com/brandonbryant12/opencode-plugins.git "$HOME/opencode-plugins"
 cd "$HOME/opencode-plugins"
 bun install --frozen-lockfile --minimum-release-age 86400
 ```
@@ -58,9 +58,11 @@ Proposal mode follows the same loop against design sections and decision criteri
 
 ## Live progress and reports
 
-The native panel opens once when an active run appears in its launching session. It shows slice and round milestones, per-slice verified rounds, active agents, elapsed time, tokens, reported cost, repair decisions, and the latest meta assessment. Click an active agent to inspect its session. Click a completed coverage mark to inspect its receipt. Press `f` for fullscreen or `esc` to close; a dismissed panel stays closed. `/goal-panel` reopens it.
+Starting a run immediately opens the native progress panel and shows a start notice. The panel keeps the current phase and **Stop run** or **Resume run** control at the top. It shows each active worker's latest activity, slice and round milestones, per-slice verified rounds, elapsed time, tokens, reported cost, repair decisions, and the latest meta assessment. Click a worker to inspect its session. Click a completed coverage mark to inspect its receipt. Press `f` for fullscreen or `esc` to close while the panel has focus; a dismissed panel stays closed. `/goal-panel` reopens it.
 
-These are completed-work counters, not estimates of time remaining or a quality score. Fix/rejection counts are finding decisions and can include duplicate findings. Cost is OpenCode-reported and may not reflect actual provider billing.
+Repeating `/goal` or `/swarm` opens the existing unfinished run instead of starting another writer. Paused runs open with their reason and an **Inspect last worker** link. After restarting OpenCode, the home screen shows a saved-run link. Progress is also reachable from other chats in the same project. If the connection fails, a visible warning replaces the live status, even when the first progress request fails. Start, status, stop and completion notices do not prompt the main assistant.
+
+Closing progress keeps the run active; use **Stop run** to pause it. These are completed-work counters, not estimates of time remaining or a quality score. Fix/rejection counts are finding decisions and can include duplicate findings. Cost is OpenCode-reported and may not reflect actual provider billing.
 
 `.opencode/goal/state.json` stores successful checkpoints. `objective.md` holds the original scope, and `receipts/` contains individually readable reports so agents do not need to load a growing state file. `.opencode/goal/report.md` includes review coverage, findings, evaluator decisions, validation evidence, independent verdicts, and meta outcomes. `findings.json` and `coverage.json` provide derived indexes with stable receipt IDs and exact-repeat links. Full conversations remain in OpenCode's worker sessions.
 
@@ -73,7 +75,11 @@ These are completed-work counters, not estimates of time remaining or a quality 
 | `/goal-resume` | Settle old workers, reuse completed receipts, retry unfinished work |
 | `/goal-panel` | Open native progress panel |
 
-The controls work for both Goal and Swarm. There is one active run per checkout. Use one OpenCode service per checkout and let the workflow own editing. Invalid reports, denied tools, failed checks, timeouts, missing coverage, and persistent findings pause the run. No failed or canceled result becomes a successful checkpoint.
+The controls work for Goal, Swarm and Proposal runs. **STOPPING** means interruption is underway; wait for **PAUSED** with zero active workers before editing files. Stop interrupts native sessions immediately, including a model request that has not returned. Resume waits for cleanup and retries unfinished work. Controls from an old panel cannot affect a newer run. `/goal-stop` also settles saved worker sessions after a coordinator restart.
+
+There is one active run per checkout. Use one OpenCode service per checkout and let the workflow own editing. Invalid reports, denied tools, failed checks, timeouts, missing coverage, and persistent findings pause the run. A model can return a JSON object or one fenced JSON block with surrounding explanation. Multiple candidate JSON blocks and reports that fail validation still pause. No failed or canceled result becomes a successful checkpoint.
+
+If a run appears invisible, update from v0.3.0 and restart both the OpenCode server and TUI. That release rejected progress before the first meta report because of a non-JSON field. Use `/goal-panel` to open saved progress, then Resume. If progress remains unavailable, `/goal-status` provides a passive status notice and `.opencode/goal/report.md` retains the last saved report.
 
 Resume assumes previously completed work has not changed. After broad manual edits, stop and settle all workers, move `.opencode/goal/` aside, and start a fresh swarm so stale receipts cannot stand in for new reviews. A terminal failed verifier is re-run after a targeted manual correction. The plugin never resets source files or commits user work. Existing v0.2 goals can resume, but their final review stage runs with the stronger new verification gates.
 
@@ -111,8 +117,10 @@ GOAL_SMOKE_MODE=swarm OPENCODE2_BIN="$(command -v opencode2)" npm run test:nativ
 GOAL_SMOKE_MODE=proposal OPENCODE2_BIN="$(command -v opencode2)" npm run test:native
 ```
 
-On shared constrained machines, run installs and checks through `~/.local/bin/codex-heavy --`. Tests use at most two workers. Native smoke tests use a local deterministic provider: they exercise real OpenCode loading, tools, permissions, sessions, reports and RPC, without paid inference. They do not benchmark GLM reasoning or simulate every compaction scenario.
+On shared constrained machines, run installs and checks through `~/.local/bin/codex-heavy --`. Tests use at most two workers. Native smoke tests use a local deterministic provider: they exercise real OpenCode loading, tools, permissions, sessions, reports and RPC, without paid inference. They check progress throughout execution, duplicate starts, a deliberately stalled provider, Stop/Resume, stale controls, native command discovery, and passive notices. They do not benchmark GLM reasoning or simulate every compaction scenario.
 
 This repository succeeds `opencode-churn`; old release tags remain available. Stop old runs, update the clone, reinstall pinned dependencies, remove old Churn options, and restart OpenCode.
+
+See the [UX verification record](docs/verification-2026-09-10.md) for reproduced defects, regression coverage, real-model results, and test limits.
 
 References: [OpenCode plugins](https://opencode.ai/v2/docs/build/plugins/), [compaction](https://opencode.ai/v2/docs/compaction), [OpenAI subagent guidance](https://developers.openai.com/codex/multi-agent), [long-running agent harnesses](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents).
