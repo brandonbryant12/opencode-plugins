@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugins",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Goal and adversarial Swarm workflows with live progress for OpenCode 2.",
   "type": "module",
   "license": "MIT",

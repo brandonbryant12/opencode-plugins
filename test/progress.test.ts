@@ -35,3 +35,18 @@ test("progress bars are bounded milestones and elapsed time never goes negative"
   assert.equal(bar(9, 2, 4), "████"); assert.equal(elapsed(2000, 1000), "0s");
   assert.equal(elapsed(null, 1000), "—");
 });
+test("every intermediate progress field is JSON-safe before the first meta report", () => {
+  const s = state();
+  s.telemetry = { parentID: "parent", startedAt: 1, updatedAt: 2, workers: {} };
+  s.outputs = {}; s.phase = "plan";
+  const p = progress(s, [], true)!;
+  // JSON.stringify alone silently drops undefined; the native RPC rejects it.
+  function check(value: unknown): void {
+    assert.notEqual(value, undefined);
+    if (Array.isArray(value)) value.forEach(check);
+    else if (value && typeof value === "object") Object.values(value).forEach(check);
+  }
+  check(p); assert.equal(p.meta, null); assert.equal(p.usageAvailable, false);
+  assert.equal(progress(s, [], true, true)?.status, "stopping");
+  assert.equal(progress(s, [], false, true)?.status, "paused");
+});

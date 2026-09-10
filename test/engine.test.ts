@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { run, plan, review, work, type State, type Role } from "../src/engine.ts";
+import { run, json, plan, review, work, type State, type Role } from "../src/engine.ts";
+
+test("one fenced JSON report can include model prose, while ambiguous reports fail", () => {
+  assert.deepEqual(json('Evidence reviewed.\n```json\n{"findings":[]}\n```\nEnd of report.'), { findings: [] });
+  assert.throws(() => json('```json\n{"findings":[]}\n```\n```json\n{"blocked":["missing proof"]}\n```'), /one JSON report/);
+  assert.throws(() => review('```json\n{"findings":[],"blocked":["missing proof"]}\n```'), /blocked/);
+});
 
 const validPlan = JSON.stringify({ slices: [{ title: "First", task: "Do first", acceptance: ["First works"] }, { title: "Second", task: "Do second", acceptance: ["Second works"] }] });
 const pass = JSON.stringify({ summary: "Checked", checks: [{ command: "npm test", result: "pass", evidence: "Tests passed" }], blocked: [], decisions: [] });

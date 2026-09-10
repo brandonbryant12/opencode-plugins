@@ -30,6 +30,8 @@ let forbiddenAttempts = 0;
 const denialEvidence: string[] = [];
 let native: ReturnType<typeof spawn> | undefined;
 let providerFailure: unknown;
+let noticesTriggeredInference = 0;
+let heldPlanner = false;
 
 const provider = createServer(async (req, res) => {
   try {
@@ -40,6 +42,15 @@ const provider = createServer(async (req, res) => {
     const messages = body.messages as { role: string; content: unknown }[];
     const text = messages.filter(m => m.role === "user").map(m => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n");
     const role = text.match(/You are the Goal (planner|implementer|reviewer|evaluator|verifier|meta)/)?.[1];
+    if (!role && text.includes("Goal workflow notice")) noticesTriggeredInference++;
+    if (role === "planner" && !heldPlanner) {
+      heldPlanner = true;
+      // Deliberately never answer the first prompt. Stop must interrupt the
+      // native session, rather than wait for a provider response or timeout.
+      await new Promise<void>(resolve => res.once("close", resolve));
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 40));
     const hasToolResult = messages.some(m => m.role === "tool");
     let result = "Goal smoke test";
     let call: { name: string; arguments: string } | undefined;
@@ -73,6 +84,7 @@ const provider = createServer(async (req, res) => {
       assert.equal(await readFile(join(directory, "answer.txt"), "utf8"), "after\n");
       result = JSON.stringify({ summary: "Answer verified", checks: [{ command: "inspect answer.txt", result: "pass", evidence: "contains after" }], blocked: [], decisions: [] });
     }
+    if (role === "reviewer" && !call) result = `Review complete.\n\`\`\`json\n${result}\n\`\`\``;
     const id = `smoke-${requests}`;
     if (body.stream) {
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -122,16 +134,43 @@ try {
   await client.plugin.awaitActivation({ location: { directory } });
   const commands = await client.command.list({ location: { directory } });
   assert.ok(commands.data.some(c => c.name === "goal"), JSON.stringify({ commands, plugins: await client.plugin.list({ location: { directory } }) }));
+  assert.ok(commands.data.some(c => c.name === "goal-panel"), "Progress is discoverable as a native slash command");
   assert.ok((await client.plugin.list({ location: { directory } })).data.some(p => p.features.tui), "Local plugin exposes its TUI entry");
   const rpc = client.rpc(GoalRPC);
   assert.equal((await rpc.progress(null, { location: { directory } }) as { progress: Progress | null }).progress, null);
+  await assert.rejects(client.session.command({ sessionID: parent.id, command: "goal", text: "" }));
+  assert.equal(await readState(join(directory, ".opencode/goal/state.json")), undefined, "Invalid input never starts a hidden run");
   if (process.env.GOAL_NATIVE_ATTACH) {
     await writeFile(process.env.GOAL_NATIVE_ATTACH, JSON.stringify({ binary, directory, root, url: `http://127.0.0.1:${port}`, password, sessionID: parent.id }), { mode: 0o600 });
     await new Promise(resolve => setTimeout(resolve, 15000));
   }
   await client.session.command({ sessionID: parent.id, command: mode === "goal" ? "goal" : "swarm", text: mode === "proposal" ? "--proposal @proposal.md" : "Change answer.txt from before to after. Keep it simple." });
+  for (let i = 0; i < 80 && !heldPlanner; i++) await new Promise(resolve => setTimeout(resolve, 250));
+  assert.ok(heldPlanner, "A real provider request is active before testing Stop");
+  const first = (await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress;
+  assert.equal(first.status, "running", "Progress works before the first meta report");
+  assert.equal(first.meta, null);
+  await client.session.command({ sessionID: parent.id, command: "goal", text: "This duplicate must not replace the first objective" });
+  assert.equal((await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress.startedAt, first.startedAt);
+  const stale = await rpc.control({ action: "stop", parentID: parent.id, startedAt: 0 }, { location: { directory } }) as { message: string };
+  assert.match(stale.message, /changed/);
+  const stoppingAt = Date.now();
+  await rpc.control({ action: "stop", parentID: parent.id, startedAt: first.startedAt }, { location: { directory } });
+  for (let i = 0; i < 80; i++) {
+    const p = (await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress;
+    if (p.status === "paused" && !p.active.length) break;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  const paused = (await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress;
+  assert.equal(paused.status, "paused"); assert.equal(paused.active.length, 0);
+  assert.ok(Date.now() - stoppingAt < 10000, "Stop cannot wait for the stalled provider or worker timeout");
+  await rpc.control({ action: "resume", parentID: parent.id, startedAt: first.startedAt }, { location: { directory } });
+  assert.equal((await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress.status, "running", "One Resume action restarts work even while the final stop notice is settling");
   let state;
   for (let i = 0; i < 480; i++) {
+    // Exercise the actual transport during every stage, not only completion.
+    const p = (await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress;
+    assert.ok(p);
     state = await readState(join(directory, ".opencode/goal/state.json"));
     if (state && state.status !== "running") break;
     await new Promise(r => setTimeout(r, 250));
@@ -146,6 +185,8 @@ try {
   assert.equal(await git.run(["rev-list", "--count", "HEAD"]), "1");
   assert.equal(state.active.length, 0);
   assert.equal(providerFailure, undefined);
+  assert.equal(noticesTriggeredInference, 0, "Start, status, stop and finish notices cannot prompt the parent model");
+  assert.ok(!(await client.session.context({ sessionID: parent.id })).some(m => m.type === "assistant"), "The coordinator's parent remains idle");
   const view = (await rpc.progress(null, { location: { directory } }) as { progress: Progress }).progress;
   assert.equal(view.parentID, parent.id);
   assert.equal(view.status, "complete");
@@ -160,6 +201,9 @@ try {
   assert.ok((await rpc.receipt({ key: "final/0/verify/1", startedAt: state.telemetry!.startedAt }, { location: { directory } }) as { receipt: string }).receipt.includes("coverage"));
   assert.equal((await rpc.receipt({ key: "../../outside", startedAt: state.telemetry!.startedAt }, { location: { directory } }) as { receipt: string | null }).receipt, null);
   assert.ok(JSON.parse(await readFile(join(directory, ".opencode/goal/coverage.json"), "utf8")).length >= 41);
+  const reviewKey = mode === "goal" ? "slice/1/review/0" : "round/1/batch/1/review/1";
+  assert.ok(Array.isArray(JSON.parse(state.outputs[reviewKey]).findings), "Checkpoint reports are canonical JSON");
+  assert.ok(Array.isArray(JSON.parse(await readFile(join(directory, ".opencode/goal/receipts", `${state.telemetry!.startedAt}-${reviewKey.replaceAll("/", "-")}.json`), "utf8")).findings), "Evidence files remain valid JSON after a model adds prose");
   assert.deepEqual(JSON.parse(await readFile(join(directory, ".opencode/goal/findings.json"), "utf8")), []);
   if (mode === "proposal") assert.match(await readFile(join(directory, "proposal.md"), "utf8"), /explicit acceptance/);
   assert.match(await readFile(join(directory, ".opencode/goal/report.md"), "utf8"), /round\/10\/assessment/);

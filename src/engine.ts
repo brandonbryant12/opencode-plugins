@@ -2,7 +2,7 @@ import { swarm } from "./swarm.ts";
 export type Slice = { title: string; task: string; acceptance: string[] };
 export type Finding = { id: string; location: string; problem: string };
 export type Role = "planner" | "implementer" | "reviewer" | "evaluator" | "verifier" | "meta";
-export type WorkerStats = { role: Role; phase: string; startedAt: number; input?: number; output?: number; cost?: number };
+export type WorkerStats = { role: Role; phase: string; startedAt: number; activity?: string; activityAt?: number; input?: number; output?: number; cost?: number };
 export type State = {
   version: 2; mode?: "goal" | "swarm" | "proposal"; proposalPath?: string; goal: string; status: "running" | "paused" | "complete";
   phase: string; reason: string; outputs: Record<string, string>; active: string[];
@@ -40,7 +40,12 @@ function text(value: unknown): string {
 }
 export function json(raw: string): Record<string, unknown> {
   if (raw.length > 32000) throw new Error("Worker report exceeds 32000 characters; keep reports concise");
-  return object(JSON.parse(raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/, "$1")));
+  const trimmed = raw.trim();
+  // Some native models add prose around the requested fenced report. Accept
+  // one explicit JSON block; never guess between multiple candidate reports.
+  const blocks = [...trimmed.matchAll(/```(?:json)?[\t ]*\r?\n([\s\S]*?)\r?\n```/g)];
+  if (blocks.length > 1) throw new Error("Return one JSON report, not multiple blocks");
+  return object(JSON.parse(blocks.length === 1 ? blocks[0][1] : trimmed));
 }
 export function plan(raw: string): Slice[] {
   const p = json(raw);
@@ -84,7 +89,7 @@ export function work(raw: string, findings: Finding[] = []): string {
   return summary;
 }
 
-export const workContract = `Return only JSON: {"summary":"concise changes and evidence","checks":[{"command":"check actually performed","result":"pass","evidence":"observed result"}],"blocked":[],"decisions":[{"id":"finding id","action":"fixed or rejected","reason":"evidence"}]}. Report failures honestly in blocked; never mark an unrun check pass. Account for each supplied finding once. Reject unsupported or out-of-scope findings with evidence. Run relevant checks after edits, following repository resource limits. No changes are required when the goal already holds.`;
+export const workContract = `Return only JSON: {"summary":"concise changes and evidence","checks":[{"command":"check actually performed","result":"pass","evidence":"observed result"}],"blocked":[],"decisions":[]}. When findings are supplied, replace decisions with exactly one {"id":"supplied finding id","action":"fixed or rejected","reason":"evidence"} per finding. With no supplied findings, decisions MUST be empty. Report failures honestly in blocked; never mark an unrun check pass. Reject unsupported or out-of-scope findings with evidence. Run relevant checks after edits, following repository resource limits. No changes are required when the goal already holds.`;
 export const reviewContract = `Return only JSON: {"findings":[{"location":"slice title and file:line","problem":"concrete defect, evidence and smallest correction"}]}. Empty findings is valid. Read files, trace behavior, and check available validation evidence. Stay within the original goal. Do not manufacture issues or request speculative abstractions. Do not edit files or execute shell commands.`;
 
 // Every worker starts fresh. Only the plan and relevant reports cross sessions.
@@ -99,8 +104,10 @@ export async function run(r: Runtime) {
     await r.report(key);
     const raw = await r.worker(role, `${key === "plan" ? `Mode: ${s.mode ?? "goal"}. ${s.mode === "proposal" ? `Source proposal: ${s.proposalPath}. Catalog its design sections; do not implement software.` : ""}\nOriginal goal:\n${s.goal}` : `Original objective is saved in .opencode/goal/objective.md (read only if needed). Mode: ${s.mode ?? "goal"}. ${s.mode === "proposal" ? `Only improve the proposal ${s.proposalPath}; do not implement the proposed software.` : ""}`}\n\n${prompt}`, key);
     r.signal.throwIfAborted();
-    const result = parse(raw);
-    s.outputs[key] = raw;
+    let result: T;
+    try { result = parse(raw); }
+    catch (error) { s.phase = key; throw new Error(`The ${role} report did not pass validation: ${error instanceof Error ? error.message : String(error)}. Inspect the last worker, then resume to retry unfinished work.`); }
+    s.outputs[key] = JSON.stringify(json(raw));
     await r.save();
     return result;
   }
